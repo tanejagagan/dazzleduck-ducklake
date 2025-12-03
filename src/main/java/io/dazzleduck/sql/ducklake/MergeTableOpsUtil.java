@@ -39,6 +39,7 @@ public class MergeTableOpsUtil {
      * change the table id's for the files in the dummy table
      * delete the files in the remove
      * commit the transaction.
+     * open conn --> begin transaction --> execute changes with connectionPool.executeBatch --> commit; close conn.
      */
     public void replace(long tableId,
                         long tempTableId,
@@ -49,6 +50,7 @@ public class MergeTableOpsUtil {
             for (String file : toAdd) {
                 ConnectionPool.execute(ADD_FILE_TO_TABLE_QUERY.formatted(database, tempTableName, file));
             }
+            ConnectionPool.execute(conn, "BEGIN TRANSACTION;");
             String filePaths = toRemove.stream().map(fp -> "'" + fp + "'").collect(Collectors.joining(", "));
             List<Long> fileIds = (List<Long>) ConnectionPool.collectFirstColumn(conn, GET_FILE_ID_BY_PATH_QUERY.formatted(mdDatabase, tableId, filePaths), Long.class);
             if (fileIds == null || fileIds.size() != toRemove.size()) {
@@ -62,16 +64,17 @@ public class MergeTableOpsUtil {
             String deleteFileQuery = DELETE_DATA_FILE_QUERY.formatted(mdDatabase, fileIdsString);
             String scheduleDeletesQuery = INSERT_INTO_SCHEDULE_FILE_DELETION_QUERY.formatted(mdDatabase, mdDatabase, fileIdsString);
 
-            ConnectionPool.executeBatchInTxn(
-                    conn,
-                    new String[]{
-                            scheduleDeletesQuery,    // Mark old files for deletion
-                            updateNewFileTableId,    // Move merged file(s) to main table
-                            deleteStatsQuery,        // Remove stats of old files
-                            deletePartitionQuery,    // Remove partition values of old files
-                            deleteFileQuery          // Remove old file entries
-                    }
-            );
+            var queries = new String[]{
+                    scheduleDeletesQuery,    // Mark old files for deletion
+                    updateNewFileTableId,    // Move merged file(s) to main table
+                    deleteStatsQuery,        // Remove stats of old files
+                    deletePartitionQuery,    // Remove partition values of old files
+                    deleteFileQuery,         // Remove old file entries
+                    "COMMIT"
+            };
+            for (String query : queries) {
+                ConnectionPool.execute(conn, query);
+            }
         }
     }
 
@@ -85,7 +88,7 @@ public class MergeTableOpsUtil {
      * baseLocation -> /data/log
      * partition -> List.Of('date', applicationid).
      */
-public List<String> rewriteWithPartitionNoCommit(List<String> inputFiles,
+    public List<String> rewriteWithPartitionNoCommit(List<String> inputFiles,
                                                      String baseLocation,
                                                      List<String> partition) throws SQLException, NoSuchMethodException {
         try (Connection conn = ConnectionPool.getConnection()) {

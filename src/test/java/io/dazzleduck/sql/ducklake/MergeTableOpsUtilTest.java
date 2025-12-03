@@ -29,7 +29,7 @@ public class MergeTableOpsUtilTest {
         catalogFile = projectTempDir.resolve(CATALOG + ".ducklake");
         dataPath = projectTempDir.resolve("data");
         Files.createDirectories(dataPath);
-        String attachDB ="ATTACH 'ducklake:%s' AS %s (DATA_PATH '%s');".formatted(catalogFile.toAbsolutePath(), CATALOG, dataPath.toAbsolutePath());
+        String attachDB = "ATTACH 'ducklake:%s' AS %s (DATA_PATH '%s');".formatted(catalogFile.toAbsolutePath(), CATALOG, dataPath.toAbsolutePath());
         ConnectionPool.execute(attachDB);
         mergeTableOpsUtil = new MergeTableOpsUtil();
     }
@@ -44,19 +44,19 @@ public class MergeTableOpsUtilTest {
         String tableName = "products";
         Path tableDir = dataPath.resolve("main").resolve(tableName);
         Files.createDirectories(tableDir);
-        Path a = tableDir.resolve("a.parquet");
-        Path b = tableDir.resolve("b.parquet");
-        Path c = tableDir.resolve("c.parquet");
-        Path d = tableDir.resolve("d.parquet");
+        Path file1 = tableDir.resolve("file1.parquet");
+        Path file2 = tableDir.resolve("file2.parquet");
+        Path file3 = tableDir.resolve("file3.parquet");
+        Path file4 = tableDir.resolve("file4.parquet");
 
         try (Connection conn = ConnectionPool.getConnection()) {
             String[] setup = {
                     "USE " + CATALOG,
                     "CREATE TABLE %s AS SELECT * FROM (VALUES (1,'A'),(2,'B')) t(id,name)".formatted(tableName),
-                    "COPY (SELECT 1 AS id, 'A' AS name) TO '%s' (FORMAT PARQUET)".formatted(a),
-                    "COPY (SELECT 2 AS id, 'B' AS name) TO '%s' (FORMAT PARQUET)".formatted(b),
-                    "COPY (SELECT 3 AS id, 'C' AS name) TO '%s' (FORMAT PARQUET)".formatted(c),
-                    "COPY (SELECT 4 AS id, 'D' AS name) TO '%s' (FORMAT PARQUET)".formatted(d)
+                    "COPY (SELECT 1 AS id, 'A' AS name) TO '%s' (FORMAT PARQUET)".formatted(file1),
+                    "COPY (SELECT 2 AS id, 'B' AS name) TO '%s' (FORMAT PARQUET)".formatted(file2),
+                    "COPY (SELECT 3 AS id, 'C' AS name) TO '%s' (FORMAT PARQUET)".formatted(file3),
+                    "COPY (SELECT 4 AS id, 'D' AS name) TO '%s' (FORMAT PARQUET)".formatted(file4)
             };
             ConnectionPool.executeBatchInTxn(conn, setup);
 
@@ -66,23 +66,23 @@ public class MergeTableOpsUtilTest {
             String dummyTable = "__dummy_" + tableId;
             ConnectionPool.execute("CREATE OR REPLACE TABLE %s.%s AS SELECT * FROM %s.%s LIMIT 0".formatted(CATALOG, dummyTable, CATALOG, tableName));
             Long tempTableId = ConnectionPool.collectFirst(GET_TABLE_ID_QUERY.formatted(METADATABASE, dummyTable), Long.class);
-            // Register A & B as original files
+            // Register file1 & file2 as original files
             String ADD_DATA_FILES_QUERY = "CALL ducklake_add_data_files('%s','%s','%s')";
-            ConnectionPool.executeBatchInTxn(conn, new String[] {ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, a), ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, b)});
-
+            ConnectionPool.executeBatchInTxn(conn, new String[]{ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file1), ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file2)});
             // Method under test
             mergeTableOpsUtil.replace(
                     tableId,
                     tempTableId,
                     CATALOG,
-                    List.of(c.toString(), d.toString()),
-                    List.of(a.getFileName().toString(), b.getFileName().toString())
+                    List.of(file3.toString(), file4.toString()),
+                    List.of(file1.getFileName().toString(), file2.getFileName().toString())
             );
-            try( var connection = ConnectionPool.getConnection()){
+            try (var connection = ConnectionPool.getConnection()) {
                 // Validate new file exists
-                Long newFileCount = ConnectionPool.collectFirst(connection, "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE path LIKE '%%%s%%'".formatted(METADATABASE, c.getFileName()), Long.class);
-                assertEquals(1, newFileCount, "Expected newly created file to be registered");
-                String oldCountSql = "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE path LIKE '%%%s%%' OR path LIKE '%%%s%%'".formatted(METADATABASE, a.getFileName(), b.getFileName());
+                Long newFileCount = ConnectionPool.collectFirst(connection, "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE path LIKE '%%%s%%' OR path LIKE '%%%s%%'".formatted(METADATABASE, file3.getFileName(), file4.getFileName()), Long.class);
+                // should be 2 (file3 and file4)
+                assertEquals(2, newFileCount, "Expected newly created file to be registered");
+                String oldCountSql = "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE path LIKE '%%%s%%' OR path LIKE '%%%s%%'".formatted(METADATABASE, file1.getFileName(), file2.getFileName());
                 // Old files removed
                 Long oldCount = ConnectionPool.collectFirst(connection, oldCountSql, Long.class);
                 assertEquals(0, oldCount, "Old files must be removed from metadata");
@@ -93,22 +93,22 @@ public class MergeTableOpsUtilTest {
         }
     }
 
-    // test where file a exist but b does not (unhappy path) it should abort with not all the files are found
+    // test where file1 exist but file2 does not (unhappy path) it should abort with not all the files are found
     @Test
-    void testOneFileNotExistUnhappyPath() throws SQLException, IOException {
+    void testReplaceOneFileNotExistUnhappyPath() throws SQLException, IOException {
         String tableName = "products";
         Path tableDir = dataPath.resolve("main").resolve(tableName);
         Files.createDirectories(tableDir);
-        Path a = tableDir.resolve("a.parquet");
-        // NO file b
-        Path c = tableDir.resolve("c.parquet");
+        Path file1 = tableDir.resolve("file1.parquet");
+        // NO file2
+        Path file3 = tableDir.resolve("file3.parquet");
 
         try (Connection conn = ConnectionPool.getConnection()) {
             String[] setup = {
                     "USE " + CATALOG,
                     "CREATE TABLE %s AS SELECT * FROM (VALUES (1,'A'),(2,'B')) t(id,name)".formatted(tableName),
-                    "COPY (SELECT 1 AS id, 'A' AS name) TO '%s' (FORMAT PARQUET)".formatted(a),
-                    "COPY (SELECT 3 AS id, 'C' AS name) TO '%s' (FORMAT PARQUET)".formatted(c)
+                    "COPY (SELECT 1 AS id, 'A' AS name) TO '%s' (FORMAT PARQUET)".formatted(file1),
+                    "COPY (SELECT 3 AS id, 'C' AS name) TO '%s' (FORMAT PARQUET)".formatted(file3)
             };
             ConnectionPool.executeBatchInTxn(conn, setup);
 
@@ -118,9 +118,9 @@ public class MergeTableOpsUtilTest {
             String dummyTable = "__dummy_" + tableId;
             ConnectionPool.execute("CREATE OR REPLACE TABLE %s.%s AS SELECT * FROM %s.%s LIMIT 0".formatted(CATALOG, dummyTable, CATALOG, tableName));
             Long tempTableId = ConnectionPool.collectFirst(GET_TABLE_ID_QUERY.formatted(METADATABASE, dummyTable), Long.class);
-            // Register A & B as original files
+            // Register file1 only
             String ADD_DATA_FILES_QUERY = "CALL ducklake_add_data_files('%s','%s','%s')";
-            ConnectionPool.executeBatchInTxn(conn, new String[] {ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, a)});
+            ConnectionPool.executeBatchInTxn(conn, new String[]{ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file1)});
 
             IllegalStateException ex = assertThrows(
                     IllegalStateException.class,
@@ -128,8 +128,8 @@ public class MergeTableOpsUtilTest {
                             tableId,
                             tempTableId,
                             CATALOG,
-                            List.of(c.toString()),
-                            List.of(a.getFileName().toString(), "b does not exist")
+                            List.of(file3.toString()),
+                            List.of(file1.getFileName().toString(), "file2 does not exist")
                     )
             );
             assertTrue(ex.getMessage().contains("One or more files scheduled for deletion were not found"), "Expected missing-file error");
@@ -161,7 +161,6 @@ public class MergeTableOpsUtilTest {
             Long tableId = ConnectionPool.collectFirst("SELECT table_id FROM %s.ducklake_table WHERE table_name='%s'".formatted(METADATABASE, tableName), Long.class);
             
             // Capture original files
-        
             var files = "SELECT CONCAT('%s', '%s', path) FROM %s.ducklake_data_file WHERE table_id = %s".formatted(tableDir.toString(), File.separator, METADATABASE, tableId);
             List<String> originalFiles = (List<String>) ConnectionPool.collectFirstColumn(conn, files, String.class);
             assertEquals(4, originalFiles.size(), "Expected 4 original parquet files");
@@ -179,21 +178,10 @@ public class MergeTableOpsUtilTest {
             assertTrue(Files.list(baseLocation).anyMatch(p -> p.getFileName().toString().contains("created_at=")), "Expected partition folders like created_at=yyyy-mm-dd");
             // Row count preserved
             String fileList = newFiles.stream().map(f -> "'" + f + "'").collect(Collectors.joining(","));
-
-            Long rowCount = ConnectionPool.collectFirst(
-                    "SELECT COUNT(*) FROM read_parquet([" + fileList + "])",
-                    Long.class
-            );
-
+            Long rowCount = ConnectionPool.collectFirst("SELECT COUNT(*) FROM read_parquet([" + fileList + "])", Long.class);
             assertEquals(4L, rowCount, "Total rows must be preserved during rewrite");
-
             // Metadata NOT changed (no commit)
-            Long afterFileCount = ConnectionPool.collectFirst(
-                    "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE table_id = %s"
-                            .formatted(METADATABASE, tableId),
-                    Long.class
-            );
-
+            Long afterFileCount = ConnectionPool.collectFirst("SELECT COUNT(*) FROM %s.ducklake_data_file WHERE table_id = %s".formatted(METADATABASE, tableId), Long.class);
             assertEquals(4L, afterFileCount, "Metadata must not change for no-commit rewrite");
         }
     }
