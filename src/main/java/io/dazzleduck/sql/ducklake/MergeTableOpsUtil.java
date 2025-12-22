@@ -12,6 +12,7 @@ import io.dazzleduck.sql.commons.ingestion.CopyResult;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 public class MergeTableOpsUtil {
@@ -62,7 +63,11 @@ public class MergeTableOpsUtil {
             if (!toRemove.isEmpty()) {
                 ConnectionPool.execute(conn, "BEGIN TRANSACTION;");
                 String filePaths = toRemove.stream().map(fp -> "'" + fp + "'").collect(Collectors.joining(", "));
-                List<Long> fileIds = (List<Long>) ConnectionPool.collectFirstColumn(conn, GET_FILE_ID_BY_PATH_QUERY.formatted(mdDatabase, tableId, filePaths), Long.class);
+                var t = ConnectionPool.collectFirstColumn(conn, GET_FILE_ID_BY_PATH_QUERY.formatted(mdDatabase, tableId, filePaths), Long.class).iterator();
+                var fileIds = new ArrayList<Long>();
+                while (t.hasNext()) {
+                    fileIds.add(t.next());
+                }
                 if (fileIds.size() != toRemove.size()) {
                     throw new IllegalStateException("One or more files scheduled for deletion were not found for tableId=" + tableId);
                 }
@@ -129,13 +134,13 @@ public class MergeTableOpsUtil {
             Path p = Paths.get(inputFile);
             Path fileName = p.getFileName();
             var tagetPath = baseLocation + fileName.toString();
-            return getStrings(inputFile, tagetPath, partition, conn);
+            return getStrings("'" + inputFile + "'", tagetPath, partition, conn);
         }
     }
 
     private static List<String> getStrings(String inputFile, String baseLocation, List<String> partition, Connection conn) {
         String partitionClause = partition.isEmpty() ? "" : "PARTITION_BY (" + String.join(", ", partition) + "),";
-        String copyQuery = COPY_TO_NEW_FILE_WITH_PARTITION_QUERY.formatted("'" + inputFile + "'", baseLocation, partitionClause);
+        String copyQuery = COPY_TO_NEW_FILE_WITH_PARTITION_QUERY.formatted(inputFile, baseLocation, partitionClause);
 
         List<String> files = new ArrayList<>();
         for (CopyResult r : ConnectionPool.collectAll(conn, copyQuery, CopyResult.class)) {

@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -163,10 +164,15 @@ public class MergeTableOpsUtilTest {
             
             // Capture original files
             var files = "SELECT CONCAT('%s', '%s', path) FROM %s.ducklake_data_file WHERE table_id = %s".formatted(tableDir.toString(), File.separator, METADATABASE, tableId);
-            List<String> originalFiles = (List<String>) ConnectionPool.collectFirstColumn(conn, files, String.class);
+            var ogFiles = ConnectionPool.collectFirstColumn(conn, files, String.class).iterator();
+            var originalFiles = new ArrayList<String>();
+            while (ogFiles.hasNext()) {
+                originalFiles.add(ogFiles.next());
+            }
+
             assertEquals(4, originalFiles.size(), "Expected 4 original parquet files");
 
-            Path baseLocation = tableDir.resolve("rewrite");
+            Path baseLocation = tableDir.resolve("rewritebb6031f9-e275-49ea-b575-ee604ea6f04f");
             Files.createDirectories(baseLocation);
             List<String> newFiles = mergeTableOpsUtil.rewriteWithPartitionNoCommit(
                     originalFiles,
@@ -206,7 +212,11 @@ public class MergeTableOpsUtilTest {
             ConnectionPool.executeBatchInTxn(conn, inserts);
 
             Long tableId = ConnectionPool.collectFirst("SELECT table_id FROM %s.ducklake_table WHERE table_name='%s'".formatted(METADATABASE, tableName), Long.class);
-            List<String> originalFiles = (List<String>) ConnectionPool.collectFirstColumn(conn, "SELECT CONCAT('%s', '%s', path) FROM %s.ducklake_data_file WHERE table_id=%s".formatted(tableDir.toString(), File.separator, METADATABASE, tableId), String.class);
+            var of = ConnectionPool.collectFirstColumn(conn, "SELECT CONCAT('%s', '%s', path) FROM %s.ducklake_data_file WHERE table_id=%s".formatted(tableDir.toString(), File.separator, METADATABASE, tableId), String.class).iterator();
+            var originalFiles = new ArrayList<String>();
+            while (of.hasNext()) {
+                originalFiles.add(of.next());
+            }
             assertEquals(4, originalFiles.size(), "Expected 4 parquet files");
 
             Path baseLocation = tableDir.resolve("rewrite");
