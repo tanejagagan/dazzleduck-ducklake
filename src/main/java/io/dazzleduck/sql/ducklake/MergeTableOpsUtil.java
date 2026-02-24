@@ -73,6 +73,11 @@ public class MergeTableOpsUtil {
                 .formatted(mdDatabase, MetadataConfig.q(), tableId);
     }
 
+    private static String moveFilesToMainTableQuery(String mdDatabase, long mainTableId, long tempTableId, long snapshotId) {
+        return "UPDATE %s%sducklake_data_file SET table_id = %s, begin_snapshot = %s WHERE table_id = %s AND end_snapshot IS NULL"
+                .formatted(mdDatabase, MetadataConfig.q(), mainTableId, snapshotId, tempTableId);
+    }
+
     // ADD_FILE_TO_TABLE_QUERY does not need qualifier - it's a CALL statement, not a metadata query
     private static final String ADD_FILE_TO_TABLE_QUERY =
             "CALL ducklake_add_data_files('%s', '%s', '%s', schema => 'main', ignore_extra_columns => true, allow_missing => true);";
@@ -84,15 +89,16 @@ public class MergeTableOpsUtil {
     /**
      * Replaces files in a table using proper DuckLake snapshot mechanism.
      *
-     * <p>Due to {@code ducklake_add_data_files} auto-committing its transaction internally,
-     * this method uses a two-phase approach (remove first, then add):
+     * <p>Since {@code ducklake_add_data_files} auto-commits internally, this method uses a
+     * temp-table approach to achieve full transactional atomicity:
      * <ol>
-     *   <li>In a single transaction: create snapshot, set end_snapshot on files to be removed</li>
-     *   <li>Add new files directly to the main table via {@code ducklake_add_data_files}</li>
+     *   <li>Phase 1 (outside transaction): Add new files to a temp table via
+     *       {@code ducklake_add_data_files} (auto-commits to temp table only)</li>
+     *   <li>Phase 2 (single transaction): Create snapshot, move file records from temp to main
+     *       table, and mark old files with end_snapshot — all atomically committed or rolled back</li>
      * </ol>
      *
-     * <p>This ordering ensures that if the add phase fails, the removal is already committed
-     * and a retry only needs to add the missing files (idempotent - already-added files are skipped).
+     * <p>Supports any combination: toAdd only, toRemove only, or both.
      *
      * <p>Files marked with end_snapshot remain visible in older snapshots until
      * {@code ducklake_expire_snapshots()} is called, which moves them to
@@ -101,8 +107,8 @@ public class MergeTableOpsUtil {
      * @param database    database/catalog name
      * @param tableId     id of the main table
      * @param mdDatabase  metadata database name
-     * @param toAdd       files to be added to the table
-     * @param toRemove    files to be marked for deletion (by setting end_snapshot)
+     * @param toAdd       files to be added to the table (can be empty)
+     * @param toRemove    files to be marked for deletion (can be empty)
      * @return the snapshot ID created for this replace operation, or -1 if both lists are empty
      * @throws SQLException             if a database access error occurs
      * @throws IllegalArgumentException if required parameters are null or blank
@@ -137,27 +143,20 @@ public class MergeTableOpsUtil {
                 throw new IllegalStateException("Table not found for tableId=" + tableId);
             }
 
-            long snapshotId = -1;
+            String tempTableName = null;
+            Long tempTableId = null;
 
-            // Phase 1: Remove old files (auto-commit mode to avoid write-write conflicts
-            // with DuckLake's internal auto-committed operations on metadata tables)
-            if (!toRemove.isEmpty()) {
-                String filePaths = toQuotedSqlList(toRemove);
-                List<Long> fileIds = collectLongList(conn, getFileIdByPathQuery(mdDatabase, tableId, filePaths));
-
-                if (fileIds.size() != toRemove.size()) {
-                    throw new IllegalStateException("One or more files scheduled for deletion were not found for tableId=" + tableId);
-                }
-
-                // Create a new snapshot and mark files for deletion
-                snapshotId = createNewSnapshot(conn, mdDatabase);
-                markFilesAsDeleted(conn, mdDatabase, snapshotId, fileIds);
-            }
-
-            // Phase 2: Add new files directly to main table (ducklake_add_data_files auto-commits each call)
+            // Phase 1: Add files to a temp table (ducklake_add_data_files auto-commits,
+            // but only affects the temp table — main table is untouched)
             if (!toAdd.isEmpty()) {
+                tempTableName = "__temp_" + tableId;
+
+                // Create temp table with same schema as main table
+                ConnectionPool.execute(conn, "CREATE OR REPLACE TABLE %s.%s AS SELECT * FROM %s.%s LIMIT 0"
+                        .formatted(database, tempTableName, database, tableName));
+                tempTableId = ConnectionPool.collectFirst(conn, getTableIdSql(mdDatabase, tempTableName), Long.class);
+
                 // Get existing active file paths to avoid duplicates on retry
-                // seems like .main should not be there need to fix this
                 var existingFilesIterator = ConnectionPool.collectFirstColumn(conn,
                         getExistingActiveFilesQuery(mdDatabase, tableId),
                         String.class).iterator();
@@ -170,12 +169,56 @@ public class MergeTableOpsUtil {
                     String fileName = extractFileName(file);
                     if (!existingFileNames.contains(fileName)) {
                         String escapedFile = escapeSql(file);
-                        ConnectionPool.execute(ADD_FILE_TO_TABLE_QUERY.formatted(database, tableName, escapedFile));
+                        ConnectionPool.execute(conn, ADD_FILE_TO_TABLE_QUERY.formatted(database, tempTableName, escapedFile));
                     }
                 }
             }
 
-            return snapshotId;
+            // Phase 2: Single transaction — create snapshot, move files, mark deletions
+            conn.setAutoCommit(false);
+            try {
+                long snapshotId = createNewSnapshot(conn, mdDatabase);
+
+                // Mark files for deletion
+                if (!toRemove.isEmpty()) {
+                    String filePaths = toQuotedSqlList(toRemove);
+                    List<Long> fileIds = collectLongList(conn, getFileIdByPathQuery(mdDatabase, tableId, filePaths));
+
+                    if (fileIds.size() != toRemove.size()) {
+                        throw new IllegalStateException("One or more files scheduled for deletion were not found for tableId=" + tableId);
+                    }
+
+                    markFilesAsDeleted(conn, mdDatabase, snapshotId, fileIds);
+                }
+
+                // Move files from temp table to main table in metadata
+                if (tempTableId != null) {
+                    ConnectionPool.execute(conn, moveFilesToMainTableQuery(mdDatabase, tableId, tempTableId, snapshotId));
+                }
+
+                conn.commit();
+
+                // Cleanup: drop temp table (outside transaction, best-effort)
+                if (tempTableName != null) {
+                    conn.setAutoCommit(true);
+                    try {
+                        ConnectionPool.execute(conn, "DROP TABLE IF EXISTS %s.%s".formatted(database, tempTableName));
+                    } catch (Exception cleanupEx) {
+                        logger.warn("Failed to drop temp table {}.{}: {}", database, tempTableName, cleanupEx.getMessage());
+                    }
+                }
+                return snapshotId;
+            } catch (Exception e) {
+                try {
+                    conn.rollback();
+                } catch (SQLException rollbackEx) {
+                    e.addSuppressed(rollbackEx);
+                }
+                if (e instanceof SQLException) throw (SQLException) e;
+                throw (RuntimeException) e;
+            } finally {
+                conn.setAutoCommit(true);
+            }
         }
     }
 
