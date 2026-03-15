@@ -8,7 +8,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import io.dazzleduck.sql.commons.ConnectionPool;
@@ -26,6 +27,31 @@ import java.util.stream.Collectors;
 
 public class MergeTableOpsUtil {
     private static final Logger logger = LoggerFactory.getLogger(MergeTableOpsUtil.class);
+
+    /**
+     * Guards concurrent DuckLake catalog writes during Phase 1.
+     *
+     * <p>Empirical testing reveals two properties of the DuckLake catalog under concurrent
+     * access from multiple {@code DuckDBConnection.duplicate()} connections:
+     * <ol>
+     *   <li><b>Concurrent {@code CREATE TABLE} is broken</b> — even when each thread creates
+     *       a completely different table, 3-4 out of 5 threads fail with
+     *       "Failed to parse catalog entry — trailing data after quoted value". The DuckLake
+     *       catalog writer is not safe for concurrent DDL.</li>
+     *   <li><b>Concurrent {@code ducklake_add_data_files()} is safe</b> — multiple threads
+     *       can call it simultaneously on pre-existing tables without any errors.</li>
+     * </ol>
+     *
+     * <p>A {@link ReadWriteLock} captures this asymmetry precisely:
+     * <ul>
+     *   <li>{@code CREATE TABLE} acquires the <em>write</em> lock — exclusive, blocks all
+     *       other catalog operations until the DDL is fully committed.</li>
+     *   <li>{@code ducklake_add_data_files()} (and the metadata reads preceding it) acquires
+     *       the <em>read</em> lock — shared, multiple add-file calls may proceed in parallel,
+     *       but none can run while a {@code CREATE TABLE} is in flight.</li>
+     * </ul>
+     */
+    private static final ReadWriteLock DUCKLAKE_CATALOG_LOCK = new ReentrantReadWriteLock();
 
     // -------------------------------------------------------------------------
     // SQL query builders — DuckDB / generic metadata path
@@ -47,11 +73,6 @@ public class MergeTableOpsUtil {
                 + "FROM %s%sducklake_table t JOIN %s%sducklake_schema s ON t.schema_id = s.schema_id "
                 + "WHERE t.table_id = %s")
                 .formatted(mdDatabase, MetadataConfig.q(), mdDatabase, MetadataConfig.q(), tableId);
-    }
-
-    private static String activeFilePathsQuery(String mdDatabase, long tableId) {
-        return "SELECT path FROM %s%sducklake_data_file WHERE table_id = %s AND end_snapshot IS NULL"
-                .formatted(mdDatabase, MetadataConfig.q(), tableId);
     }
 
     private static String fileIdsByPathQuery(String mdDatabase, long tableId, String quotedPaths) {
@@ -84,10 +105,10 @@ public class MergeTableOpsUtil {
                 .formatted(mdDatabase, MetadataConfig.q(), snapshotId, fileIds);
     }
 
-    private static String moveFilesToMainTableQuery(String mdDatabase, long mainTableId, long tempTableId, long snapshotId) {
+    private static String moveFilesByIdsQuery(String mdDatabase, long mainTableId, long snapshotId, String fileIds) {
         return ("UPDATE %s%sducklake_data_file SET table_id = %s, begin_snapshot = %s "
-                + "WHERE table_id = %s AND end_snapshot IS NULL")
-                .formatted(mdDatabase, MetadataConfig.q(), mainTableId, snapshotId, tempTableId);
+                + "WHERE data_file_id IN (%s) AND end_snapshot IS NULL")
+                .formatted(mdDatabase, MetadataConfig.q(), mainTableId, snapshotId, fileIds);
     }
 
     // -------------------------------------------------------------------------
@@ -118,10 +139,10 @@ public class MergeTableOpsUtil {
                 .formatted(PG_SCHEMA, snapshotId, fileIds);
     }
 
-    private static String pgMoveFilesToMainTableQuery(long mainTableId, long tempTableId, long snapshotId) {
+    private static String pgMoveFilesByIdsQuery(long mainTableId, long snapshotId, String fileIds) {
         return ("UPDATE %s.ducklake_data_file SET table_id = %s, begin_snapshot = %s "
-                + "WHERE table_id = %s AND end_snapshot IS NULL")
-                .formatted(PG_SCHEMA, mainTableId, snapshotId, tempTableId);
+                + "WHERE data_file_id IN (%s) AND end_snapshot IS NULL")
+                .formatted(PG_SCHEMA, mainTableId, snapshotId, fileIds);
     }
 
     // -------------------------------------------------------------------------
@@ -144,10 +165,13 @@ public class MergeTableOpsUtil {
      * <p>Because {@code ducklake_add_data_files} auto-commits internally, a temp-table
      * approach is used for atomicity:
      * <ol>
-     *   <li>Phase 1 (outside transaction): register new files under a temp table via
-     *       {@code ducklake_add_data_files} (auto-commits to temp table only).</li>
-     *   <li>Phase 2 (single atomic transaction): create a snapshot, move temp-table file
-     *       records to the main table, and retire old files with {@code end_snapshot}.</li>
+     *   <li>Phase 1 (outside transaction): register new files under a persistent temp table
+     *       ({@code __temp_<tableId>}) via {@code ducklake_add_data_files}, which auto-commits
+     *       to the temp table only. The resulting {@code data_file_id}s are captured.</li>
+     *   <li>Phase 2 (single atomic transaction): create a snapshot, move the captured file IDs
+     *       from the temp table to the main table, and retire old files with {@code end_snapshot}.
+     *       Moving by explicit ID (rather than by temp-table ownership) is safe for concurrent
+     *       callers sharing the same persistent temp table.</li>
      * </ol>
      *
      * <p>When a direct Postgres connection is configured ({@link MetadataConfig#isPostgres()}),
@@ -184,30 +208,35 @@ public class MergeTableOpsUtil {
                 throw new IllegalStateException("Table not found for tableId=" + tableId);
             }
 
-            String tempTableName = null;
-            Long tempTableId = null;
-            try {
-                // Phase 1: register new files under a temp table (auto-commits to temp table only).
-                if (!toAdd.isEmpty()) {
-                    tempTableName = "__temp_" + tableId + "_" + UUID.randomUUID().toString().replace("-", "");
-                    tempTableId = addFilesToTempTable(conn, database, mdDatabase, tableName, tableId, tempTableName, toAdd);
+            // Phase 1: register new files under the persistent temp table (auto-commits to temp table only).
+            // The temp table name is deterministic (__temp_<tableId>) and reused across calls.
+            // See DUCKLAKE_CATALOG_LOCK javadoc for the full race analysis.
+            List<Long> toAddIds = null;
+            if (!toAdd.isEmpty()) {
+                String tempTableName = "__temp_" + tableId;
+                // CREATE TABLE IF NOT EXISTS is idempotent: a no-op when the table already exists.
+                // The write lock is still required because we cannot know whether the table exists
+                // without a separate query — and if it does not, this call writes to the DuckLake
+                // catalog. Always holding the write lock here is simpler and safe in both cases.
+                DUCKLAKE_CATALOG_LOCK.writeLock().lock();
+                try {
+                    ConnectionPool.execute(conn, "CREATE TABLE IF NOT EXISTS %s.%s AS SELECT * FROM %s.%s LIMIT 0"
+                            .formatted(database, tempTableName, database, tableName));
+                } finally {
+                    DUCKLAKE_CATALOG_LOCK.writeLock().unlock();
                 }
-
-                // Phase 2: atomically create snapshot, move temp files to main table, retire old files.
-                return MetadataConfig.isPostgres()
-                        ? commitViaPostgres(tableId, tempTableId, toRemove)
-                        : commitViaDuckDb(conn, mdDatabase, tableId, tempTableId, toRemove);
-
-            } finally {
-                // Always drop temp table, whether Phase 2 committed or rolled back.
-                if (tempTableName != null) {
-                    try {
-                        ConnectionPool.execute(conn, "DROP TABLE IF EXISTS %s.%s".formatted(database, tempTableName));
-                    } catch (Exception e) {
-                        logger.warn("Failed to drop temp table {}.{}: {}", database, tempTableName, e.getMessage());
-                    }
+                DUCKLAKE_CATALOG_LOCK.readLock().lock();
+                try {
+                    toAddIds = registerFilesInTempTable(conn, database, mdDatabase, tempTableName, toAdd);
+                } finally {
+                    DUCKLAKE_CATALOG_LOCK.readLock().unlock();
                 }
             }
+
+            // Phase 2: atomically create snapshot, move temp files to main table, retire old files.
+            return MetadataConfig.isPostgres()
+                    ? commitViaPostgres(tableId, toAddIds, toRemove)
+                    : commitViaDuckDb(conn, mdDatabase, tableId, toAddIds, toRemove);
         }
     }
 
@@ -408,41 +437,40 @@ public class MergeTableOpsUtil {
     // =========================================================================
 
     /**
-     * Phase 1: creates a temp table, then registers each file in {@code toAdd} under it via
-     * {@code ducklake_add_data_files}, skipping files already active in the main table.
+     * Phase 1: registers each file in {@code toAdd} under the persistent temp table via
+     * {@code ducklake_add_data_files}, then returns all active {@code data_file_id}s in the
+     * temp table. The temp table must exist and its catalog entry must be fully committed
+     * before this method is called (caller holds the read lock — see {@link #DUCKLAKE_CATALOG_LOCK}).
      *
-     * @return the temp-table ID assigned by DuckLake metadata
+     * @return the {@code data_file_id}s of all active files currently in the temp table;
+     *         includes IDs from any previous failed Phase 2 that did not complete the move
      */
-    private static long addFilesToTempTable(Connection conn,
-                                            String database,
-                                            String mdDatabase,
-                                            String tableName,
-                                            long tableId,
-                                            String tempTableName,
-                                            List<String> toAdd) throws SQLException {
-        ConnectionPool.execute(conn, "CREATE OR REPLACE TABLE %s.%s AS SELECT * FROM %s.%s LIMIT 0"
-                .formatted(database, tempTableName, database, tableName));
+    private static List<Long> registerFilesInTempTable(Connection conn,
+                                                        String database,
+                                                        String mdDatabase,
+                                                        String tempTableName,
+                                                        List<String> toAdd) throws SQLException {
         long tempTableId = ConnectionPool.collectFirst(conn, tableIdByNameQuery(mdDatabase, tempTableName), Long.class);
 
-        // Skip files already registered in the main table (idempotency on retry).
-        Set<String> existingPaths = new HashSet<>();
-        ConnectionPool.collectFirstColumn(conn, activeFilePathsQuery(mdDatabase, tableId), String.class)
-                .forEach(existingPaths::add);
-
         for (String file : toAdd) {
-            if (!existingPaths.contains(file)) {
-                ConnectionPool.execute(conn, ADD_FILE_TO_TABLE_QUERY.formatted(database, tempTableName, escapeSql(file)));
-            }
+            ConnectionPool.execute(conn, ADD_FILE_TO_TABLE_QUERY.formatted(database, tempTableName, escapeSql(file)));
         }
-        return tempTableId;
+
+        // Query back exactly the IDs for the files we just added — not all files in the temp
+        // table — so Phase 2 moves only what this call registered, nothing more.
+        return queryLongList(conn, fileIdsByPathQuery(mdDatabase, tempTableId, toQuotedSqlList(toAdd)));
     }
 
     /**
      * Phase 2 via direct Postgres JDBC: creates a snapshot with {@code INSERT...RETURNING}
-     * (race-free), retires old files, and moves temp-table files to the main table —
+     * (race-free), retires old files, and moves the given file IDs to the main table —
      * all within a single Postgres transaction.
+     *
+     * <p>Using explicit {@code data_file_id}s (rather than {@code WHERE table_id = tempTableId})
+     * makes the move deterministic: concurrent calls on the same temp table cannot accidentally
+     * move each other's files.
      */
-    private static long commitViaPostgres(long tableId, Long tempTableId, List<String> toRemove) throws SQLException {
+    private static long commitViaPostgres(long tableId, List<Long> toAddIds, List<String> toRemove) throws SQLException {
         try (Connection pgConn = MetadataConfig.getPostgresConnection()) {
             pgConn.setAutoCommit(false);
             try {
@@ -457,8 +485,8 @@ public class MergeTableOpsUtil {
                     executeJdbc(pgConn, pgSetEndSnapshotQuery(snapshotId, joinIds(fileIds)));
                 }
 
-                if (tempTableId != null) {
-                    executeJdbc(pgConn, pgMoveFilesToMainTableQuery(tableId, tempTableId, snapshotId));
+                if (toAddIds != null && !toAddIds.isEmpty()) {
+                    executeJdbc(pgConn, pgMoveFilesByIdsQuery(tableId, snapshotId, joinIds(toAddIds)));
                 }
 
                 pgConn.commit();
@@ -478,13 +506,17 @@ public class MergeTableOpsUtil {
 
     /**
      * Phase 2 via DuckDB connection: creates a snapshot using two queries (INSERT then MAX),
-     * retires old files, and moves temp-table files to the main table —
+     * retires old files, and moves the given file IDs to the main table —
      * all within a single DuckDB transaction.
+     *
+     * <p>Using explicit {@code data_file_id}s (rather than {@code WHERE table_id = tempTableId})
+     * makes the move deterministic: concurrent calls on the same temp table cannot accidentally
+     * move each other's files.
      */
     private static long commitViaDuckDb(Connection conn,
                                         String mdDatabase,
                                         long tableId,
-                                        Long tempTableId,
+                                        List<Long> toAddIds,
                                         List<String> toRemove) throws SQLException {
         conn.setAutoCommit(false);
         try {
@@ -499,8 +531,8 @@ public class MergeTableOpsUtil {
                 markFilesAsDeleted(conn, mdDatabase, snapshotId, fileIds);
             }
 
-            if (tempTableId != null) {
-                ConnectionPool.execute(conn, moveFilesToMainTableQuery(mdDatabase, tableId, tempTableId, snapshotId));
+            if (toAddIds != null && !toAddIds.isEmpty()) {
+                ConnectionPool.execute(conn, moveFilesByIdsQuery(mdDatabase, tableId, snapshotId, joinIds(toAddIds)));
             }
 
             conn.commit();
@@ -532,8 +564,16 @@ public class MergeTableOpsUtil {
     /**
      * Creates a snapshot via a direct Postgres JDBC connection using {@code INSERT...RETURNING},
      * atomically returning the new snapshot ID without a race condition.
+     *
+     * <p>A {@code LOCK TABLE} in {@code SHARE ROW EXCLUSIVE MODE} is acquired first so that
+     * concurrent transactions cannot both read the same {@code MAX(snapshot_id)} and then collide
+     * on the primary-key constraint when inserting the new row.  The lock is released automatically
+     * at transaction end.
      */
     private static long createSnapshotViaPostgres(Connection pgConn) throws SQLException {
+        try (Statement lock = pgConn.createStatement()) {
+            lock.execute("LOCK TABLE " + PG_SCHEMA + ".ducklake_snapshot IN SHARE ROW EXCLUSIVE MODE");
+        }
         try (Statement stmt = pgConn.createStatement();
              ResultSet rs = stmt.executeQuery(pgCreateSnapshotQuery())) {
             if (!rs.next()) {
